@@ -96,6 +96,33 @@ function flattenContent(c) {
 
 function tryParseJson(s) { try { return JSON.parse(s); } catch { return { result: s }; } }
 
+// CodeWhisperer требует, чтобы toolUseId начинался с "tooluse_"
+// OpenAI шлёт "call_xxx", Anthropic SDK — "toolu_xxx"; нормализуем все в "tooluse_<rest>"
+function normalizeToolUseId(id) {
+  if (!id) return `tooluse_${crypto.randomBytes(10).toString("hex")}`;
+  if (id.startsWith("tooluse_")) return id;
+  // Срезаем известные префиксы и добавляем нужный
+  const stripped = id.replace(/^(toolu_|call_|tool_)/, "");
+  return `tooluse_${stripped}`;
+}
+
+// Возвращает Set валидных toolUseId из последнего assistantResponseMessage в history.
+// Kiro отклоняет toolResults, чьи id не матчатся с предыдущим toolUses.
+function lastAssistantToolIds(history) {
+  for (let i = history.length - 1; i >= 0; i--) {
+    const h = history[i];
+    if (h.assistantResponseMessage?.toolUses?.length) {
+      return new Set(h.assistantResponseMessage.toolUses.map(t => t.toolUseId));
+    }
+    if (h.assistantResponseMessage) break; // ближайший assistant без toolUses — значит разрыв цепочки
+  }
+  return new Set();
+}
+
+function filterOrphanToolResults(results, validIds) {
+  return results.filter(r => validIds.has(r.toolUseId));
+}
+
 function openaiToKiro(body) {
   const { messages, tools: openaiTools } = body;
   const model = normalizeModel(body.model);
@@ -118,7 +145,11 @@ function openaiToKiro(body) {
         pendingAssistantMessage = null;
       }
       if (pendingToolResults.length) {
-        history.push({ userInputMessage: { content: "", userInputMessageContext: { toolResults: pendingToolResults }, origin: "KIRO_CLI", modelId: model } });
+        const validIds = lastAssistantToolIds(history);
+        const kept = filterOrphanToolResults(pendingToolResults, validIds);
+        if (kept.length) {
+          history.push({ userInputMessage: { content: "", userInputMessageContext: { toolResults: kept }, origin: "KIRO_CLI", modelId: model } });
+        }
         pendingToolResults = [];
       }
       // If there's already a pending user message, flush it (shouldn't happen normally)
@@ -131,22 +162,34 @@ function openaiToKiro(body) {
         pendingAssistantMessage = null;
       }
       if (pendingToolResults.length) {
-        history.push({ userInputMessage: { content: pendingUserMessage ? pendingUserMessage.content : "", userInputMessageContext: { toolResults: pendingToolResults }, origin: "KIRO_CLI", modelId: model } });
+        const validIds = lastAssistantToolIds(history);
+        const kept = filterOrphanToolResults(pendingToolResults, validIds);
+        if (kept.length) {
+          history.push({ userInputMessage: { content: pendingUserMessage ? pendingUserMessage.content : "", userInputMessageContext: { toolResults: kept }, origin: "KIRO_CLI", modelId: model } });
+        } else if (pendingUserMessage && pendingUserMessage.content) {
+          // orphan toolResults отбрасываем, но если был текст — всё равно пропушим его
+          history.push({ userInputMessage: { ...pendingUserMessage } });
+        }
         pendingToolResults = [];
         pendingUserMessage = null;
       } else if (pendingUserMessage) {
         history.push({ userInputMessage: pendingUserMessage }); pendingUserMessage = null;
       }
-      const assistantMsg = { content: flattenContent(msg.content) };
+      const assistantMsg = { messageId: crypto.randomUUID(), content: flattenContent(msg.content) };
       if (msg.tool_calls?.length) {
         assistantMsg.toolUses = msg.tool_calls.map(tc => ({
-          toolUseId: tc.id, name: tc.function?.name || tc.name,
-          input: typeof tc.function?.arguments === "string" ? JSON.parse(tc.function.arguments || "{}") : (tc.function?.arguments || tc.input || {})
+          toolUseId: normalizeToolUseId(tc.id),
+          name: tc.function?.name || tc.name,
+          input: typeof tc.function?.arguments === "string" ? (tc.function.arguments ? tryParseJson(tc.function.arguments) : {}) : (tc.function?.arguments || tc.input || {})
         }));
+      }
+      // Не пушим ассистента, у которого ни текста ни tool_uses (Kiro отклонит)
+      if (!assistantMsg.content && !assistantMsg.toolUses) {
+        assistantMsg.content = ".";
       }
       pendingAssistantMessage = assistantMsg;
     } else if (msg.role === "tool") {
-      pendingToolResults.push({ toolUseId: msg.tool_call_id, content: [{ json: typeof msg.content === "string" ? tryParseJson(msg.content) : msg.content }], status: "success" });
+      pendingToolResults.push({ toolUseId: normalizeToolUseId(msg.tool_call_id), content: [{ json: typeof msg.content === "string" ? tryParseJson(msg.content) : msg.content }], status: "success" });
     }
   }
   if (pendingAssistantMessage) { history.push({ assistantResponseMessage: pendingAssistantMessage }); pendingAssistantMessage = null; }
@@ -156,14 +199,23 @@ function openaiToKiro(body) {
 
   let currentMessage;
   if (pendingToolResults.length) {
-    userContext.toolResults = pendingToolResults;
-    currentMessage = { userInputMessage: { content: pendingUserMessage ? pendingUserMessage.content : "", userInputMessageContext: userContext, origin: "KIRO_CLI", modelId: model } };
+    const validIds = lastAssistantToolIds(history);
+    const kept = filterOrphanToolResults(pendingToolResults, validIds);
+    if (kept.length) {
+      userContext.toolResults = kept;
+      const content = pendingUserMessage?.content || "continue";
+      currentMessage = { userInputMessage: { content, userInputMessageContext: userContext, origin: "KIRO_CLI", modelId: model } };
+    } else {
+      const content = pendingUserMessage?.content || "continue";
+      currentMessage = { userInputMessage: { content, userInputMessageContext: userContext, origin: "KIRO_CLI", modelId: model } };
+    }
   } else if (pendingUserMessage) {
     let content = pendingUserMessage.content;
     if (systemPrompt) content = systemPrompt + content;
+    if (!content) content = ".";
     currentMessage = { userInputMessage: { content, userInputMessageContext: userContext, origin: "KIRO_CLI", modelId: model } };
   } else {
-    currentMessage = { userInputMessage: { content: systemPrompt, userInputMessageContext: userContext, origin: "KIRO_CLI", modelId: model } };
+    currentMessage = { userInputMessage: { content: systemPrompt || ".", userInputMessageContext: userContext, origin: "KIRO_CLI", modelId: model } };
   }
 
   return { conversationState: { conversationId: crypto.randomUUID(), history, currentMessage, chatTriggerType: "MANUAL", agentTaskType: "vibe" } };
@@ -217,6 +269,14 @@ const server = http.createServer((req, res) => {
           proxyRes.on("data", d => err += d);
           proxyRes.on("end", () => {
             console.error(`[KIRO] ${proxyRes.statusCode}: ${err.slice(0,300)}`);
+            if (proxyRes.statusCode === 400) {
+              try {
+                const fs = require("fs");
+                const dumpPath = `/tmp/kiro-proxy-400-${Date.now()}.json`;
+                fs.writeFileSync(dumpPath, JSON.stringify({ incoming: parsed, outgoing: kiroReq, err }, null, 2));
+                console.error(`[KIRO] 400 dump -> ${dumpPath}`);
+              } catch (e) { console.error("[KIRO] dump fail:", e.message); }
+            }
             res.writeHead(proxyRes.statusCode, { "Content-Type": "application/json" });
             res.end(JSON.stringify({ error: { message: err.slice(0,400), code: proxyRes.statusCode } }));
           });
