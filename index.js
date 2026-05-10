@@ -6,7 +6,13 @@ const Database = require("better-sqlite3");
 
 const PORT = parseInt(process.env.KIRO_PROXY_PORT || "11436");
 const HOST = "q.us-east-1.amazonaws.com";
-const DB_PATH = path.join(process.env.HOME, ".local/share/kiro-cli/data.sqlite3");
+const DB_PATH = process.env.KIRO_DB_PATH || (() => {
+  const home = process.env.HOME || process.env.USERPROFILE || "";
+  if (process.platform === "win32") {
+    return path.join(process.env.APPDATA || path.join(home, "AppData", "Roaming"), "kiro-cli", "data.sqlite3");
+  }
+  return path.join(home, ".local", "share", "kiro-cli", "data.sqlite3");
+})();
 
 function getToken() {
   const db = new Database(DB_PATH, { readonly: true });
