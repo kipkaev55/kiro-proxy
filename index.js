@@ -106,10 +106,31 @@ function openaiToKiro(body) {
 
   for (const msg of nonSystem) {
     if (msg.role === "user") {
-      if (pendingAssistantMessage) { history.push({ assistantResponseMessage: pendingAssistantMessage }); pendingAssistantMessage = null; }
+      // Flush pending assistant + tool results as a pair before new user message
+      if (pendingAssistantMessage) {
+        history.push({ assistantResponseMessage: pendingAssistantMessage });
+        pendingAssistantMessage = null;
+      }
+      if (pendingToolResults.length) {
+        history.push({ userInputMessage: { content: "", userInputMessageContext: { toolResults: pendingToolResults }, origin: "KIRO_CLI", modelId: model } });
+        pendingToolResults = [];
+      }
+      // If there's already a pending user message, flush it (shouldn't happen normally)
+      if (pendingUserMessage) { history.push({ userInputMessage: pendingUserMessage }); pendingUserMessage = null; }
       pendingUserMessage = { content: flattenContent(msg.content), userInputMessageContext: {}, origin: "KIRO_CLI", modelId: model };
     } else if (msg.role === "assistant") {
-      if (pendingUserMessage) { history.push({ userInputMessage: pendingUserMessage }); pendingUserMessage = null; }
+      // Flush pending assistant + tool results as a pair, then pending user
+      if (pendingAssistantMessage) {
+        history.push({ assistantResponseMessage: pendingAssistantMessage });
+        pendingAssistantMessage = null;
+      }
+      if (pendingToolResults.length) {
+        history.push({ userInputMessage: { content: pendingUserMessage ? pendingUserMessage.content : "", userInputMessageContext: { toolResults: pendingToolResults }, origin: "KIRO_CLI", modelId: model } });
+        pendingToolResults = [];
+        pendingUserMessage = null;
+      } else if (pendingUserMessage) {
+        history.push({ userInputMessage: pendingUserMessage }); pendingUserMessage = null;
+      }
       const assistantMsg = { content: flattenContent(msg.content) };
       if (msg.tool_calls?.length) {
         assistantMsg.toolUses = msg.tool_calls.map(tc => ({
@@ -161,6 +182,7 @@ const server = http.createServer((req, res) => {
     req.on("end", () => {
       let parsed;
       try { parsed = JSON.parse(raw); } catch { res.writeHead(400); res.end('{"error":"bad json"}'); return; }
+      console.log("[DEBUG] model:", parsed.model, "msgs:", parsed.messages?.length, "tools:", parsed.tools?.length || 0, "stream:", parsed.stream);
 
       let tokenData;
       try { tokenData = getToken(); } catch (e) { res.writeHead(500); res.end(JSON.stringify({ error: { message: e.message } })); return; }
@@ -168,6 +190,7 @@ const server = http.createServer((req, res) => {
       const kiroReq = openaiToKiro(parsed);
       kiroReq.profileArn = tokenData.profile_arn;
       const body = JSON.stringify(kiroReq);
+      console.log("[DEBUG] kiroReq body (first 800):", body.slice(0, 800));
       const model = normalizeModel(parsed.model);
       const id = `chatcmpl-kiro-${Date.now()}`;
       const streaming = parsed.stream;
