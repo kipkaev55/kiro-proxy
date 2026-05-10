@@ -38,7 +38,11 @@ Expose the free models available through your Kiro login — **Claude Opus 4.7, 
 
 - **Node.js 18+**
 - **Kiro CLI** installed and logged in (`kiro-cli login` once). Get it from [kiro.dev](https://kiro.dev).
-- Linux/macOS (Windows may need path adjustments — Kiro SQLite path differs).
+- **Linux, macOS, Windows** — all supported. Kiro SQLite path is auto-detected:
+  - Linux: `$XDG_DATA_HOME/kiro-cli/data.sqlite3` or `~/.local/share/kiro-cli/data.sqlite3`
+  - macOS: `~/.local/share/kiro-cli/data.sqlite3` (Kiro CLI uses XDG layout)
+  - Windows: `%APPDATA%\kiro-cli\data.sqlite3`
+  - Override with `KIRO_DB_PATH=/custom/path/data.sqlite3`
 
 ## Install
 
@@ -50,15 +54,27 @@ npm install
 
 ## Run
 
-### Manual
+### Linux / macOS
 
 ```bash
+./start.sh
+# or
 node index.js
 ```
 
-Listens on `http://127.0.0.1:11436`.
+### Windows
 
-Override port: `KIRO_PROXY_PORT=12000 node index.js`.
+```powershell
+# PowerShell
+.\start.ps1
+```
+
+```cmd
+:: cmd.exe
+start.cmd
+```
+
+Listens on `http://127.0.0.1:11436`. Override port via `KIRO_PROXY_PORT`.
 
 ### systemd (Linux, autostart on login)
 
@@ -206,7 +222,14 @@ See [PROTOCOL.md](./PROTOCOL.md) for the full Kiro wire protocol.
 - **Reasoning / thinking tokens** (Opus 4.7 adaptive thinking): not surfaced to clients.
 - **Rate limits**: whatever your Kiro subscription credit pool allows.
 - **Token refresh**: relies on external `kiro-cli` invocation. Could be replaced by direct OIDC refresh.
-- **Kiro SQLite path** is hardcoded to `~/.local/share/kiro-cli/data.sqlite3` (Linux). macOS/Windows paths may differ.
+
+## Environment variables
+
+| Name | Default | Description |
+|---|---|---|
+| `KIRO_PROXY_PORT` | `11436` | Listen port. |
+| `KIRO_DB_PATH` | auto | Override path to Kiro CLI SQLite DB. |
+| `KIRO_DUMP_DIR` | `os.tmpdir()` | Where 400-error debug dumps are written. |
 
 ## License
 

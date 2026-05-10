@@ -2,17 +2,35 @@ const http = require("http");
 const https = require("https");
 const crypto = require("crypto");
 const path = require("path");
+const os = require("os");
 const Database = require("better-sqlite3");
 
 const PORT = parseInt(process.env.KIRO_PROXY_PORT || "11436");
 const HOST = "q.us-east-1.amazonaws.com";
 const DB_PATH = process.env.KIRO_DB_PATH || (() => {
-  const home = process.env.HOME || process.env.USERPROFILE || "";
+  const home = process.env.HOME || process.env.USERPROFILE || os.homedir();
   if (process.platform === "win32") {
     return path.join(process.env.APPDATA || path.join(home, "AppData", "Roaming"), "kiro-cli", "data.sqlite3");
   }
-  return path.join(home, ".local", "share", "kiro-cli", "data.sqlite3");
+  if (process.platform === "darwin") {
+    // Kiro CLI on macOS uses XDG-style path under $HOME, not ~/Library
+    const xdg = process.env.XDG_DATA_HOME || path.join(home, ".local", "share");
+    return path.join(xdg, "kiro-cli", "data.sqlite3");
+  }
+  // Linux and other unixes — XDG
+  const xdg = process.env.XDG_DATA_HOME || path.join(home, ".local", "share");
+  return path.join(xdg, "kiro-cli", "data.sqlite3");
 })();
+
+// Cross-platform OS identifier for Kiro envState
+function kiroOsName() {
+  if (process.platform === "win32") return "windows";
+  if (process.platform === "darwin") return "mac";
+  return "linux";
+}
+
+// Cross-platform temp dir for 400-dump artifacts
+const DUMP_DIR = process.env.KIRO_DUMP_DIR || os.tmpdir();
 
 function getToken() {
   const db = new Database(DB_PATH, { readonly: true });
@@ -194,7 +212,7 @@ function openaiToKiro(body) {
   }
   if (pendingAssistantMessage) { history.push({ assistantResponseMessage: pendingAssistantMessage }); pendingAssistantMessage = null; }
 
-  const userContext = { envState: { operatingSystem: "linux", currentWorkingDirectory: process.cwd() } };
+  const userContext = { envState: { operatingSystem: kiroOsName(), currentWorkingDirectory: process.cwd() } };
   if (openaiTools) userContext.tools = openaiToolsToKiro(openaiTools);
 
   let currentMessage;
@@ -272,7 +290,7 @@ const server = http.createServer((req, res) => {
             if (proxyRes.statusCode === 400) {
               try {
                 const fs = require("fs");
-                const dumpPath = `/tmp/kiro-proxy-400-${Date.now()}.json`;
+                const dumpPath = path.join(DUMP_DIR, `kiro-proxy-400-${Date.now()}.json`);
                 fs.writeFileSync(dumpPath, JSON.stringify({ incoming: parsed, outgoing: kiroReq, err }, null, 2));
                 console.error(`[KIRO] 400 dump -> ${dumpPath}`);
               } catch (e) { console.error("[KIRO] dump fail:", e.message); }
