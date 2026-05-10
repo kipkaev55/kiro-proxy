@@ -1,0 +1,10 @@
+node_modules/
+*.log
+.env
+.env.*
+.DS_Store
+kiro-proxy.log
+/captures/
+/captures_raw/
+/captures_full/
+/tools_capture/
