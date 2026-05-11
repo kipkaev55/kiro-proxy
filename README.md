@@ -6,6 +6,33 @@ Expose the free models available through your Kiro login — **Claude Opus 4.7, 
 
 > Works by reading the OAuth access token that Kiro CLI stores locally after login, and translating between OpenAI chat format and Kiro's internal `AmazonCodeWhispererStreamingService.GenerateAssistantResponse` protocol.
 
+## Quick install (OpenAI-compatible)
+
+One-liner, no git clone needed.
+
+**Linux / macOS**
+
+```bash
+curl -fsSL https://raw.githubusercontent.com/bigdata2211it-web/kiro-proxy/main/install/install.sh | bash
+```
+
+**Windows (PowerShell)**
+
+```powershell
+iwr -useb https://raw.githubusercontent.com/bigdata2211it-web/kiro-proxy/main/install/install.ps1 | iex
+```
+
+The installer:
+- checks Node 18+ (prints install hint if missing),
+- clones the repo to a sensible OS-specific location,
+- runs `npm install --omit=dev`,
+- registers autostart (systemd user unit on Linux, LaunchAgent on macOS, Scheduled Task on Windows),
+- smoke-tests `http://127.0.0.1:11436`.
+
+Details, environment overrides, uninstall: see [install/README.md](install/README.md).
+
+---
+
 ## Features
 
 - ✅ `/v1/chat/completions` with **real streaming** (SSE) and non-streaming
