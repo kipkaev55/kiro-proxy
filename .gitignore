@@ -8,3 +8,9 @@ kiro-proxy.log
 /captures_raw/
 /captures_full/
 /tools_capture/
+
+# Real system-instructions config (private). Only the *.example.json is tracked.
+system-instructions.json
+/config/system-instructions.json
+/instructions/
+/private/

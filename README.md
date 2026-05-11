@@ -195,6 +195,61 @@ curl http://127.0.0.1:11436/v1/chat/completions \
   }'
 ```
 
+## Custom system instructions
+
+The proxy can prepend (or append, or replace) your own system instructions
+to every request, loaded from plain markdown files. Handy when the client
+doesn't know about your rules, or you want the same persona/rules across
+many different clients.
+
+Copy the example config:
+
+```bash
+mkdir -p ~/.config/kiro-proxy
+cp system-instructions.example.json ~/.config/kiro-proxy/system-instructions.json
+# edit it, point `files[].path` at your own .md files
+```
+
+Minimal config:
+
+```json
+{
+  "enabled": true,
+  "mode": "prepend",
+  "files": [
+    { "path": "/abs/path/to/your/AGENTS.md", "required": true }
+  ]
+}
+```
+
+Modes:
+
+- `prepend` — your text before whatever the client sent (default).
+- `append` — your text after.
+- `replace` — ignore the client's system prompt entirely.
+- `off` — pass through untouched.
+
+Per-request override: send `X-Proxy-Instructions: off` (or `replace`, etc.)
+with your request to override the configured mode for that call only.
+
+Check what's loaded:
+
+```bash
+curl -s http://127.0.0.1:11436/debug/instructions | jq .
+```
+
+Force a reload without restart:
+
+```bash
+curl -s -X POST http://127.0.0.1:11436/debug/instructions/reload | jq .
+```
+
+See `examples/` for three ready-to-use packs: `minimal/`, `coding/`, `persona/`.
+
+Your real `system-instructions.json` and any private rule files are
+gitignored by default — the repo only ships the example config and the
+generic example packs.
+
 ## How it works
 
 ```
@@ -230,6 +285,7 @@ See [PROTOCOL.md](./PROTOCOL.md) for the full Kiro wire protocol.
 | `KIRO_PROXY_PORT` | `11436` | Listen port. |
 | `KIRO_DB_PATH` | auto | Override path to Kiro CLI SQLite DB. |
 | `KIRO_DUMP_DIR` | `os.tmpdir()` | Where 400-error debug dumps are written. |
+| `KIRO_PROXY_INSTRUCTIONS_CONFIG` | auto | Path to custom `system-instructions.json`. |
 
 ## License
 

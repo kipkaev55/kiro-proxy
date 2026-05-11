@@ -4,6 +4,7 @@ const crypto = require("crypto");
 const path = require("path");
 const os = require("os");
 const Database = require("better-sqlite3");
+const systemInstructions = require("./system-instructions");
 
 const PORT = parseInt(process.env.KIRO_PROXY_PORT || "11436");
 const HOST = "q.us-east-1.amazonaws.com";
@@ -195,7 +196,7 @@ function filterOrphanToolResults(results, validIds) {
   return results.filter(r => validIds.has(r.toolUseId));
 }
 
-function openaiToKiro(body, overrideModel) {
+function openaiToKiro(body, overrideModel, instructionsHeader) {
   const { messages, tools: openaiTools } = body;
   const model = overrideModel || normalizeModel(body.model);
   const history = [];
@@ -207,6 +208,8 @@ function openaiToKiro(body, overrideModel) {
   for (const msg of messages) {
     if (msg.role === "system") systemPrompt += flattenContent(msg.content) + "\n";
   }
+  // Apply extra system instructions (loaded from files if configured).
+  systemPrompt = systemInstructions.apply(systemPrompt.trim(), instructionsHeader);
   const nonSystem = messages.filter(m => m.role !== "system");
 
   for (const msg of nonSystem) {
@@ -326,7 +329,7 @@ function kiroAttempt(body, tokenData) {
 // Пытается отправить запрос с retry+fallback, пока не получит 200 или не исчерпает все попытки.
 // onSuccess(proxyRes, usedModel) — вызвать со стримом ответа.
 // onFail({statusCode, body, usedModel}) — финальная ошибка, отдать клиенту.
-async function sendWithRetry(parsed, tokenData, onSuccess, onFail) {
+async function sendWithRetry(parsed, tokenData, instructionsHeader, onSuccess, onFail) {
   const requestedModel = normalizeModel(parsed.model);
   const chain = fallbackFor(requestedModel);
   let usedModel = requestedModel;
@@ -338,7 +341,7 @@ async function sendWithRetry(parsed, tokenData, onSuccess, onFail) {
     let capacityStrikes = 0;
 
     for (let attempt = 0; attempt < RETRY_MAX; attempt++) {
-      const kiroReq = openaiToKiro(parsed, tryModel);
+      const kiroReq = openaiToKiro(parsed, tryModel, instructionsHeader);
       kiroReq.profileArn = tokenData.profile_arn;
       const bodyStr = JSON.stringify(kiroReq);
 
@@ -404,6 +407,18 @@ const server = http.createServer((req, res) => {
   }
   if (req.url === "/health") { res.writeHead(200); res.end("ok"); return; }
 
+  if (req.url === "/debug/instructions") {
+    res.writeHead(200, { "Content-Type": "application/json" });
+    res.end(JSON.stringify(systemInstructions.status(), null, 2));
+    return;
+  }
+  if (req.url === "/debug/instructions/reload" && req.method === "POST") {
+    systemInstructions.reload();
+    res.writeHead(200, { "Content-Type": "application/json" });
+    res.end(JSON.stringify(systemInstructions.status(), null, 2));
+    return;
+  }
+
   if (req.url === "/v1/chat/completions" && req.method === "POST") {
     console.log("[REQ]", new Date().toISOString(), req.headers["user-agent"] || "?");
     let raw = "";
@@ -418,8 +433,9 @@ const server = http.createServer((req, res) => {
 
       const id = `chatcmpl-kiro-${Date.now()}`;
       const streaming = parsed.stream;
+      const instructionsHeader = req.headers["x-proxy-instructions"];
 
-      await sendWithRetry(parsed, tokenData,
+      await sendWithRetry(parsed, tokenData, instructionsHeader,
         (proxyRes, usedModel) => {
           if (streaming) {
             res.writeHead(200, { "Content-Type": "text/event-stream", "Cache-Control": "no-cache", "Connection": "keep-alive" });
