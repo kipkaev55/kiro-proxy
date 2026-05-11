@@ -7,29 +7,87 @@ const Database = require("better-sqlite3");
 
 const PORT = parseInt(process.env.KIRO_PROXY_PORT || "11436");
 const HOST = "q.us-east-1.amazonaws.com";
+
+// ─────────────────────────────────────────────────────────────
+// Retry / fallback config
+// ─────────────────────────────────────────────────────────────
+const RETRY_MAX = parseInt(process.env.KIRO_RETRY_MAX || "5");
+const RETRY_BASE_MS = parseInt(process.env.KIRO_RETRY_BASE_MS || "800");
+const RETRY_CAP_MS = parseInt(process.env.KIRO_RETRY_CAP_MS || "8000");
+// Если модель throttled N раз подряд — переключаемся на следующую в цепочке
+const FALLBACK_AFTER = parseInt(process.env.KIRO_FALLBACK_AFTER || "2");
+
+function parseFallbackChain(raw) {
+  if (!raw) return null;
+  return raw.split(",").map(s => s.trim()).filter(Boolean);
+}
+const USER_FALLBACK = parseFallbackChain(process.env.KIRO_FALLBACK_MODELS);
+
+// Default fallback chains — проверенные. Если модель throttled — следующая.
+const DEFAULT_FALLBACK = {
+  "claude-opus-4.7":   ["claude-opus-4.7", "claude-opus-4.6", "claude-sonnet-4.6", "auto"],
+  "claude-opus-4.6":   ["claude-opus-4.6", "claude-opus-4.5", "claude-sonnet-4.6", "auto"],
+  "claude-opus-4.5":   ["claude-opus-4.5", "claude-sonnet-4.5", "claude-sonnet-4.6", "auto"],
+  "claude-sonnet-4.6": ["claude-sonnet-4.6", "claude-sonnet-4.5", "claude-sonnet-4", "auto"],
+  "claude-sonnet-4.5": ["claude-sonnet-4.5", "claude-sonnet-4", "claude-sonnet-4.6", "auto"],
+  "claude-sonnet-4":   ["claude-sonnet-4", "claude-sonnet-4.5", "auto"],
+  "claude-haiku-4.5":  ["claude-haiku-4.5", "claude-haiku-4", "claude-sonnet-4.6", "auto"],
+  "claude-haiku-4":    ["claude-haiku-4", "claude-haiku-4.5", "auto"],
+  "auto":              ["auto", "claude-sonnet-4.6", "claude-haiku-4.5"]
+};
+
+function fallbackFor(model) {
+  if (USER_FALLBACK && USER_FALLBACK.length) return USER_FALLBACK;
+  return DEFAULT_FALLBACK[model] || [model];
+}
+
+// Sleep helper
+const sleep = ms => new Promise(r => setTimeout(r, ms));
+function backoff(attempt) {
+  const exp = Math.min(RETRY_CAP_MS, RETRY_BASE_MS * Math.pow(2, attempt));
+  return Math.floor(exp / 2 + Math.random() * (exp / 2));
+}
+
+// Распознаём транзиентные/capacity ошибки, на которых имеет смысл ретрай/фоллбэк
+function classifyError(statusCode, body) {
+  if (statusCode === 429) return { retryable: true, capacity: true, reason: "429" };
+  if (statusCode >= 500 && statusCode <= 599) return { retryable: true, capacity: false, reason: `${statusCode}` };
+  if (statusCode === 400) {
+    try {
+      const j = JSON.parse(body);
+      const t = (j.__type || j.type || "").toLowerCase();
+      const r = (j.reason || "").toLowerCase();
+      const m = (j.message || "").toLowerCase();
+      if (t.includes("throttling") || t.includes("throttle")) return { retryable: true, capacity: true, reason: "throttling" };
+      if (r.includes("insufficient_model_capacity") || m.includes("insufficient_model_capacity")) return { retryable: true, capacity: true, reason: "capacity" };
+      if (m.includes("high traffic") || m.includes("try again")) return { retryable: true, capacity: true, reason: "traffic" };
+    } catch {}
+  }
+  return { retryable: false, capacity: false, reason: "hard" };
+}
+
+// ─────────────────────────────────────────────────────────────
+// Kiro DB / token
+// ─────────────────────────────────────────────────────────────
 const DB_PATH = process.env.KIRO_DB_PATH || (() => {
   const home = process.env.HOME || process.env.USERPROFILE || os.homedir();
   if (process.platform === "win32") {
     return path.join(process.env.APPDATA || path.join(home, "AppData", "Roaming"), "kiro-cli", "data.sqlite3");
   }
   if (process.platform === "darwin") {
-    // Kiro CLI on macOS uses XDG-style path under $HOME, not ~/Library
     const xdg = process.env.XDG_DATA_HOME || path.join(home, ".local", "share");
     return path.join(xdg, "kiro-cli", "data.sqlite3");
   }
-  // Linux and other unixes — XDG
   const xdg = process.env.XDG_DATA_HOME || path.join(home, ".local", "share");
   return path.join(xdg, "kiro-cli", "data.sqlite3");
 })();
 
-// Cross-platform OS identifier for Kiro envState
 function kiroOsName() {
   if (process.platform === "win32") return "windows";
   if (process.platform === "darwin") return "mac";
   return "linux";
 }
 
-// Cross-platform temp dir for 400-dump artifacts
 const DUMP_DIR = process.env.KIRO_DUMP_DIR || os.tmpdir();
 
 function getToken() {
@@ -41,22 +99,22 @@ function getToken() {
 }
 
 // ─────────────────────────────────────────────────────────────
-// Incremental AWS Event Stream parser (для стриминга)
+// AWS Event Stream parser
 // ─────────────────────────────────────────────────────────────
 class EventStreamParser {
   constructor() { this.buf = Buffer.alloc(0); }
-  
+
   feed(chunk) {
     this.buf = Buffer.concat([this.buf, chunk]);
     const events = [];
     while (this.buf.length >= 12) {
       const totalLen = this.buf.readUInt32BE(0);
       if (this.buf.length < totalLen) break;
-      
+
       const headersLen = this.buf.readUInt32BE(4);
       const headerEnd = 12 + headersLen;
       const payloadEnd = totalLen - 4;
-      
+
       let hp = 12;
       const headers = {};
       while (hp < headerEnd) {
@@ -80,6 +138,7 @@ const VALID_MODELS = new Set([
   "claude-sonnet-4.5","claude-sonnet-4","claude-haiku-4.5","claude-haiku-4",
   "deepseek-3.2","minimax-m2.5","minimax-m2.1","qwen3-coder-next","glm-5"
 ]);
+
 function normalizeModel(m) {
   if (!m) return "auto";
   if (VALID_MODELS.has(m)) return m;
@@ -114,25 +173,20 @@ function flattenContent(c) {
 
 function tryParseJson(s) { try { return JSON.parse(s); } catch { return { result: s }; } }
 
-// CodeWhisperer требует, чтобы toolUseId начинался с "tooluse_"
-// OpenAI шлёт "call_xxx", Anthropic SDK — "toolu_xxx"; нормализуем все в "tooluse_<rest>"
 function normalizeToolUseId(id) {
   if (!id) return `tooluse_${crypto.randomBytes(10).toString("hex")}`;
   if (id.startsWith("tooluse_")) return id;
-  // Срезаем известные префиксы и добавляем нужный
   const stripped = id.replace(/^(toolu_|call_|tool_)/, "");
   return `tooluse_${stripped}`;
 }
 
-// Возвращает Set валидных toolUseId из последнего assistantResponseMessage в history.
-// Kiro отклоняет toolResults, чьи id не матчатся с предыдущим toolUses.
 function lastAssistantToolIds(history) {
   for (let i = history.length - 1; i >= 0; i--) {
     const h = history[i];
     if (h.assistantResponseMessage?.toolUses?.length) {
       return new Set(h.assistantResponseMessage.toolUses.map(t => t.toolUseId));
     }
-    if (h.assistantResponseMessage) break; // ближайший assistant без toolUses — значит разрыв цепочки
+    if (h.assistantResponseMessage) break;
   }
   return new Set();
 }
@@ -141,9 +195,9 @@ function filterOrphanToolResults(results, validIds) {
   return results.filter(r => validIds.has(r.toolUseId));
 }
 
-function openaiToKiro(body) {
+function openaiToKiro(body, overrideModel) {
   const { messages, tools: openaiTools } = body;
-  const model = normalizeModel(body.model);
+  const model = overrideModel || normalizeModel(body.model);
   const history = [];
   let systemPrompt = "";
   let pendingToolResults = [];
@@ -157,7 +211,6 @@ function openaiToKiro(body) {
 
   for (const msg of nonSystem) {
     if (msg.role === "user") {
-      // Flush pending assistant + tool results as a pair before new user message
       if (pendingAssistantMessage) {
         history.push({ assistantResponseMessage: pendingAssistantMessage });
         pendingAssistantMessage = null;
@@ -170,11 +223,9 @@ function openaiToKiro(body) {
         }
         pendingToolResults = [];
       }
-      // If there's already a pending user message, flush it (shouldn't happen normally)
       if (pendingUserMessage) { history.push({ userInputMessage: pendingUserMessage }); pendingUserMessage = null; }
       pendingUserMessage = { content: flattenContent(msg.content), userInputMessageContext: {}, origin: "KIRO_CLI", modelId: model };
     } else if (msg.role === "assistant") {
-      // Flush pending assistant + tool results as a pair, then pending user
       if (pendingAssistantMessage) {
         history.push({ assistantResponseMessage: pendingAssistantMessage });
         pendingAssistantMessage = null;
@@ -185,7 +236,6 @@ function openaiToKiro(body) {
         if (kept.length) {
           history.push({ userInputMessage: { content: pendingUserMessage ? pendingUserMessage.content : "", userInputMessageContext: { toolResults: kept }, origin: "KIRO_CLI", modelId: model } });
         } else if (pendingUserMessage && pendingUserMessage.content) {
-          // orphan toolResults отбрасываем, но если был текст — всё равно пропушим его
           history.push({ userInputMessage: { ...pendingUserMessage } });
         }
         pendingToolResults = [];
@@ -201,7 +251,6 @@ function openaiToKiro(body) {
           input: typeof tc.function?.arguments === "string" ? (tc.function.arguments ? tryParseJson(tc.function.arguments) : {}) : (tc.function?.arguments || tc.input || {})
         }));
       }
-      // Не пушим ассистента, у которого ни текста ни tool_uses (Kiro отклонит)
       if (!assistantMsg.content && !assistantMsg.toolUses) {
         assistantMsg.content = ".";
       }
@@ -239,6 +288,110 @@ function openaiToKiro(body) {
   return { conversationState: { conversationId: crypto.randomUUID(), history, currentMessage, chatTriggerType: "MANUAL", agentTaskType: "vibe" } };
 }
 
+// ─────────────────────────────────────────────────────────────
+// Одна попытка HTTPS-запроса к Kiro. Резолвится объектом:
+//   { ok: true, proxyRes }  — 200, стримим дальше
+//   { ok: false, statusCode, body, cls } — ошибка, решаем: ретрай/фоллбэк/отдать наверх
+//   { ok: false, transport: err } — сетевая ошибка
+// ─────────────────────────────────────────────────────────────
+function kiroAttempt(body, tokenData) {
+  return new Promise((resolve) => {
+    const opts = {
+      hostname: HOST, port: 443, path: "/", method: "POST",
+      headers: {
+        "content-type": "application/x-amz-json-1.0",
+        "x-amz-target": "AmazonCodeWhispererStreamingService.GenerateAssistantResponse",
+        "authorization": `Bearer ${tokenData.access_token}`,
+        "content-length": Buffer.byteLength(body)
+      }
+    };
+    const req = https.request(opts, (proxyRes) => {
+      if (proxyRes.statusCode === 200) {
+        resolve({ ok: true, proxyRes });
+        return;
+      }
+      let errBody = "";
+      proxyRes.on("data", d => errBody += d);
+      proxyRes.on("end", () => {
+        const cls = classifyError(proxyRes.statusCode, errBody);
+        resolve({ ok: false, statusCode: proxyRes.statusCode, body: errBody, cls });
+      });
+    });
+    req.on("error", (err) => resolve({ ok: false, transport: err }));
+    req.write(body);
+    req.end();
+  });
+}
+
+// Пытается отправить запрос с retry+fallback, пока не получит 200 или не исчерпает все попытки.
+// onSuccess(proxyRes, usedModel) — вызвать со стримом ответа.
+// onFail({statusCode, body, usedModel}) — финальная ошибка, отдать клиенту.
+async function sendWithRetry(parsed, tokenData, onSuccess, onFail) {
+  const requestedModel = normalizeModel(parsed.model);
+  const chain = fallbackFor(requestedModel);
+  let usedModel = requestedModel;
+  let lastErr = null;
+
+  for (let modelIdx = 0; modelIdx < chain.length; modelIdx++) {
+    const tryModel = chain[modelIdx];
+    usedModel = tryModel;
+    let capacityStrikes = 0;
+
+    for (let attempt = 0; attempt < RETRY_MAX; attempt++) {
+      const kiroReq = openaiToKiro(parsed, tryModel);
+      kiroReq.profileArn = tokenData.profile_arn;
+      const bodyStr = JSON.stringify(kiroReq);
+
+      const res = await kiroAttempt(bodyStr, tokenData);
+      if (res.ok) {
+        return onSuccess(res.proxyRes, usedModel);
+      }
+      lastErr = res;
+
+      if (res.transport) {
+        console.error(`[KIRO] transport err: ${res.transport.message} (model=${tryModel} attempt=${attempt})`);
+        await sleep(backoff(attempt));
+        continue;
+      }
+
+      const { statusCode, body, cls } = res;
+      console.error(`[KIRO] ${statusCode} (${cls.reason}) model=${tryModel} attempt=${attempt}: ${body.slice(0,180)}`);
+
+      if (statusCode === 400) {
+        try {
+          const fs = require("fs");
+          const dumpPath = path.join(DUMP_DIR, `kiro-proxy-400-${Date.now()}.json`);
+          fs.writeFileSync(dumpPath, JSON.stringify({ incoming: parsed, outgoing: kiroReq, err: body, model: tryModel }, null, 2));
+        } catch {}
+      }
+
+      if (!cls.retryable) {
+        return onFail({ statusCode, body, usedModel });
+      }
+      if (cls.capacity) capacityStrikes++;
+
+      // Если модель упёрлась в capacity FALLBACK_AFTER раз — не мучаем, идём на следующую
+      if (cls.capacity && capacityStrikes >= FALLBACK_AFTER && modelIdx < chain.length - 1) {
+        console.warn(`[KIRO] capacity exhausted on ${tryModel}, falling back to ${chain[modelIdx+1]}`);
+        break;
+      }
+      await sleep(backoff(attempt));
+    }
+  }
+
+  // Все попытки и все fallback-модели исчерпаны
+  if (lastErr && lastErr.transport) {
+    return onFail({ statusCode: 502, body: JSON.stringify({ error: { message: lastErr.transport.message, type: "upstream_unavailable" } }), usedModel });
+  }
+  if (lastErr) {
+    return onFail({ statusCode: lastErr.statusCode, body: lastErr.body, usedModel });
+  }
+  return onFail({ statusCode: 503, body: JSON.stringify({ error: { message: "All fallback models exhausted", type: "capacity_exhausted" } }), usedModel });
+}
+
+// ─────────────────────────────────────────────────────────────
+// HTTP сервер
+// ─────────────────────────────────────────────────────────────
 const server = http.createServer((req, res) => {
   res.setHeader("Access-Control-Allow-Origin", "*");
   res.setHeader("Access-Control-Allow-Headers", "*");
@@ -255,7 +408,7 @@ const server = http.createServer((req, res) => {
     console.log("[REQ]", new Date().toISOString(), req.headers["user-agent"] || "?");
     let raw = "";
     req.on("data", c => raw += c);
-    req.on("end", () => {
+    req.on("end", async () => {
       let parsed;
       try { parsed = JSON.parse(raw); } catch { res.writeHead(400); res.end('{"error":"bad json"}'); return; }
       console.log("[DEBUG] model:", parsed.model, "msgs:", parsed.messages?.length, "tools:", parsed.tools?.length || 0, "stream:", parsed.stream);
@@ -263,137 +416,105 @@ const server = http.createServer((req, res) => {
       let tokenData;
       try { tokenData = getToken(); } catch (e) { res.writeHead(500); res.end(JSON.stringify({ error: { message: e.message } })); return; }
 
-      const kiroReq = openaiToKiro(parsed);
-      kiroReq.profileArn = tokenData.profile_arn;
-      const body = JSON.stringify(kiroReq);
-      console.log("[DEBUG] kiroReq body (first 800):", body.slice(0, 800));
-      const model = normalizeModel(parsed.model);
       const id = `chatcmpl-kiro-${Date.now()}`;
       const streaming = parsed.stream;
 
-      const opts = {
-        hostname: HOST, port: 443, path: "/", method: "POST",
-        headers: {
-          "content-type": "application/x-amz-json-1.0",
-          "x-amz-target": "AmazonCodeWhispererStreamingService.GenerateAssistantResponse",
-          "authorization": `Bearer ${tokenData.access_token}`,
-          "content-length": Buffer.byteLength(body)
-        }
-      };
-
-      const proxyReq = https.request(opts, (proxyRes) => {
-        if (proxyRes.statusCode !== 200) {
-          let err = "";
-          proxyRes.on("data", d => err += d);
-          proxyRes.on("end", () => {
-            console.error(`[KIRO] ${proxyRes.statusCode}: ${err.slice(0,300)}`);
-            if (proxyRes.statusCode === 400) {
-              try {
-                const fs = require("fs");
-                const dumpPath = path.join(DUMP_DIR, `kiro-proxy-400-${Date.now()}.json`);
-                fs.writeFileSync(dumpPath, JSON.stringify({ incoming: parsed, outgoing: kiroReq, err }, null, 2));
-                console.error(`[KIRO] 400 dump -> ${dumpPath}`);
-              } catch (e) { console.error("[KIRO] dump fail:", e.message); }
-            }
-            res.writeHead(proxyRes.statusCode, { "Content-Type": "application/json" });
-            res.end(JSON.stringify({ error: { message: err.slice(0,400), code: proxyRes.statusCode } }));
-          });
-          return;
-        }
-
-        if (streaming) {
-          // РЕАЛЬНЫЙ streaming — прокидываем chunks по мере получения
-          res.writeHead(200, { "Content-Type": "text/event-stream", "Cache-Control": "no-cache", "Connection": "keep-alive" });
-          const parser = new EventStreamParser();
-          const toolCallsById = new Map();
-          let toolCallIndex = 0;
-
-          proxyRes.on("data", (chunk) => {
-            const events = parser.feed(chunk);
-            for (const e of events) {
-              if (e.type === "assistantResponseEvent") {
-                try {
-                  const d = JSON.parse(e.payload);
-                  if (d.content) {
-                    res.write(`data: ${JSON.stringify({
-                      id, object: "chat.completion.chunk", model, created: Math.floor(Date.now()/1000),
-                      choices: [{ index: 0, delta: { content: d.content }, finish_reason: null }]
-                    })}\n\n`);
-                  }
-                } catch {}
-              } else if (e.type === "toolUseEvent") {
-                try {
-                  const d = JSON.parse(e.payload);
-                  if (!toolCallsById.has(d.toolUseId)) {
-                    // Первый chunk — отправляем начало tool call с id+name
-                    toolCallsById.set(d.toolUseId, { index: toolCallIndex++, sent_name: false });
-                    const tc = toolCallsById.get(d.toolUseId);
-                    res.write(`data: ${JSON.stringify({
-                      id, object: "chat.completion.chunk", model, created: Math.floor(Date.now()/1000),
-                      choices: [{ index: 0, delta: { tool_calls: [{ index: tc.index, id: d.toolUseId, type: "function", function: { name: d.name, arguments: "" } }] }, finish_reason: null }]
-                    })}\n\n`);
-                    tc.sent_name = true;
-                  }
-                  if (d.input !== undefined && d.input !== "") {
-                    const tc = toolCallsById.get(d.toolUseId);
-                    res.write(`data: ${JSON.stringify({
-                      id, object: "chat.completion.chunk", model, created: Math.floor(Date.now()/1000),
-                      choices: [{ index: 0, delta: { tool_calls: [{ index: tc.index, function: { arguments: d.input } }] }, finish_reason: null }]
-                    })}\n\n`);
-                  }
-                } catch {}
-              }
-            }
-          });
-
-          proxyRes.on("end", () => {
-            const finishReason = toolCallsById.size > 0 ? "tool_calls" : "stop";
-            res.write(`data: ${JSON.stringify({
-              id, object: "chat.completion.chunk", model, created: Math.floor(Date.now()/1000),
-              choices: [{ index: 0, delta: {}, finish_reason: finishReason }]
-            })}\n\n`);
-            res.write("data: [DONE]\n\n");
-            res.end();
-          });
-
-          proxyRes.on("error", (e) => { console.error("[KIRO] stream err:", e.message); try { res.end(); } catch {} });
-        } else {
-          // Non-stream — буферизуем всё
-          const chunks = [];
-          proxyRes.on("data", d => chunks.push(d));
-          proxyRes.on("end", () => {
+      await sendWithRetry(parsed, tokenData,
+        (proxyRes, usedModel) => {
+          if (streaming) {
+            res.writeHead(200, { "Content-Type": "text/event-stream", "Cache-Control": "no-cache", "Connection": "keep-alive" });
             const parser = new EventStreamParser();
-            const events = parser.feed(Buffer.concat(chunks));
-            const contentParts = [];
             const toolCallsById = new Map();
-            for (const e of events) {
-              if (e.type === "assistantResponseEvent") {
-                try { const d = JSON.parse(e.payload); if (d.content) contentParts.push(d.content); } catch {}
-              } else if (e.type === "toolUseEvent") {
-                try {
-                  const d = JSON.parse(e.payload);
-                  if (!toolCallsById.has(d.toolUseId)) toolCallsById.set(d.toolUseId, { id: d.toolUseId, name: d.name, parts: [] });
-                  if (d.input !== undefined) toolCallsById.get(d.toolUseId).parts.push(d.input);
-                } catch {}
+            let toolCallIndex = 0;
+
+            proxyRes.on("data", (chunk) => {
+              const events = parser.feed(chunk);
+              for (const e of events) {
+                if (e.type === "assistantResponseEvent") {
+                  try {
+                    const d = JSON.parse(e.payload);
+                    if (d.content) {
+                      res.write(`data: ${JSON.stringify({
+                        id, object: "chat.completion.chunk", model: usedModel, created: Math.floor(Date.now()/1000),
+                        choices: [{ index: 0, delta: { content: d.content }, finish_reason: null }]
+                      })}\n\n`);
+                    }
+                  } catch {}
+                } else if (e.type === "toolUseEvent") {
+                  try {
+                    const d = JSON.parse(e.payload);
+                    if (!toolCallsById.has(d.toolUseId)) {
+                      toolCallsById.set(d.toolUseId, { index: toolCallIndex++, sent_name: false });
+                      const tc = toolCallsById.get(d.toolUseId);
+                      res.write(`data: ${JSON.stringify({
+                        id, object: "chat.completion.chunk", model: usedModel, created: Math.floor(Date.now()/1000),
+                        choices: [{ index: 0, delta: { tool_calls: [{ index: tc.index, id: d.toolUseId, type: "function", function: { name: d.name, arguments: "" } }] }, finish_reason: null }]
+                      })}\n\n`);
+                      tc.sent_name = true;
+                    }
+                    if (d.input !== undefined && d.input !== "") {
+                      const tc = toolCallsById.get(d.toolUseId);
+                      res.write(`data: ${JSON.stringify({
+                        id, object: "chat.completion.chunk", model: usedModel, created: Math.floor(Date.now()/1000),
+                        choices: [{ index: 0, delta: { tool_calls: [{ index: tc.index, function: { arguments: d.input } }] }, finish_reason: null }]
+                      })}\n\n`);
+                    }
+                  } catch {}
+                }
               }
-            }
-            const toolCalls = [...toolCallsById.values()].map(tc => ({ id: tc.id, type: "function", function: { name: tc.name, arguments: tc.parts.join("") || "{}" } }));
-            const content = contentParts.join("");
-            const message = { role: "assistant", content: content || null };
-            if (toolCalls.length) message.tool_calls = toolCalls;
-            const finishReason = toolCalls.length ? "tool_calls" : "stop";
-            res.writeHead(200, { "Content-Type": "application/json" });
-            res.end(JSON.stringify({
-              id, object: "chat.completion", model, created: Math.floor(Date.now()/1000),
-              choices: [{ index: 0, message, finish_reason: finishReason }],
-              usage: { prompt_tokens: 0, completion_tokens: 0, total_tokens: 0 }
-            }));
-          });
+            });
+
+            proxyRes.on("end", () => {
+              const finishReason = toolCallsById.size > 0 ? "tool_calls" : "stop";
+              res.write(`data: ${JSON.stringify({
+                id, object: "chat.completion.chunk", model: usedModel, created: Math.floor(Date.now()/1000),
+                choices: [{ index: 0, delta: {}, finish_reason: finishReason }]
+              })}\n\n`);
+              res.write("data: [DONE]\n\n");
+              res.end();
+            });
+            proxyRes.on("error", (e) => { console.error("[KIRO] stream err:", e.message); try { res.end(); } catch {} });
+          } else {
+            const chunks = [];
+            proxyRes.on("data", d => chunks.push(d));
+            proxyRes.on("end", () => {
+              const parser = new EventStreamParser();
+              const events = parser.feed(Buffer.concat(chunks));
+              const contentParts = [];
+              const toolCallsById = new Map();
+              for (const e of events) {
+                if (e.type === "assistantResponseEvent") {
+                  try { const d = JSON.parse(e.payload); if (d.content) contentParts.push(d.content); } catch {}
+                } else if (e.type === "toolUseEvent") {
+                  try {
+                    const d = JSON.parse(e.payload);
+                    if (!toolCallsById.has(d.toolUseId)) toolCallsById.set(d.toolUseId, { id: d.toolUseId, name: d.name, parts: [] });
+                    if (d.input !== undefined) toolCallsById.get(d.toolUseId).parts.push(d.input);
+                  } catch {}
+                }
+              }
+              const toolCalls = [...toolCallsById.values()].map(tc => ({ id: tc.id, type: "function", function: { name: tc.name, arguments: tc.parts.join("") || "{}" } }));
+              const content = contentParts.join("");
+              const message = { role: "assistant", content: content || null };
+              if (toolCalls.length) message.tool_calls = toolCalls;
+              const finishReason = toolCalls.length ? "tool_calls" : "stop";
+              res.writeHead(200, { "Content-Type": "application/json" });
+              res.end(JSON.stringify({
+                id, object: "chat.completion", model: usedModel, created: Math.floor(Date.now()/1000),
+                choices: [{ index: 0, message, finish_reason: finishReason }],
+                usage: { prompt_tokens: 0, completion_tokens: 0, total_tokens: 0 }
+              }));
+            });
+          }
+        },
+        ({ statusCode, body, usedModel }) => {
+          console.error(`[KIRO] final fail model=${usedModel} status=${statusCode}`);
+          res.writeHead(statusCode || 502, { "Content-Type": "application/json" });
+          let parsedBody;
+          try { parsedBody = JSON.parse(body); } catch { parsedBody = { raw: body }; }
+          res.end(JSON.stringify({ error: { message: parsedBody.message || parsedBody.raw || "upstream error", code: statusCode, model: usedModel, upstream: parsedBody } }));
         }
-      });
-      proxyReq.on("error", e => { console.error("[KIRO] err:", e.message); res.writeHead(502); res.end(JSON.stringify({ error: { message: e.message } })); });
-      proxyReq.write(body);
-      proxyReq.end();
+      );
     });
     return;
   }
@@ -401,5 +522,5 @@ const server = http.createServer((req, res) => {
 });
 
 server.listen(PORT, "127.0.0.1", () => {
-  console.log(`[kiro-proxy] v3 http://127.0.0.1:${PORT} (real streaming + tool calls)`);
+  console.log(`[kiro-proxy] v4 http://127.0.0.1:${PORT} (retry=${RETRY_MAX}, fallback_after=${FALLBACK_AFTER})`);
 });
